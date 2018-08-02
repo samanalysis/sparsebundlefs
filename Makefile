@@ -26,8 +26,15 @@ FUSE_FLAGS := $(shell $(PKG_CONFIG) fuse --cflags --libs)
 $(TARGET): sparsebundlefs.cpp
 	$(CXX) $< -o $@ $(CFLAGS) $(FUSE_FLAGS) $(LFLAGS) $(DEFINES)
 
-all: $(TARGET)
+first: $(TARGET)
 
 clean:
 	rm -f $(TARGET)
 	rm -Rf $(TARGET).dSYM
+
+linux-gcc: linux-gcc-32 linux-gcc-64
+
+linux-gcc-%:
+	@docker-compose run -T --rm $@
+
+all: first linux-gcc

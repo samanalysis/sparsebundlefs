@@ -1,0 +1,37 @@
+version: '3'
+
+services:
+  linux-gcc-32:
+    build:
+      context: .
+      dockerfile: Dockerfile.linux-gcc
+      args:
+        - arch=i386
+    volumes:
+      - .:/src
+      - linux-gcc-32:/build
+    working_dir: /build
+    command: make -f /src/Makefile
+    environment:
+      - CFLAGS=-m32
+
+  linux-gcc-64:
+    build:
+      context: .
+      dockerfile: Dockerfile.linux-gcc
+      args:
+        - arch=amd64
+    volumes:
+      - .:/src
+      - linux-gcc-64:/build
+    working_dir: /build
+    command: make -f /src/Makefile
+
+volumes:
+  linux-gcc-32:
+  linux-gcc-64:
+
+networks:
+  default:
+    external:
+      name: none
