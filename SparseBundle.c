@@ -5,11 +5,13 @@
 #include <fcntl.h>
 #include <err.h>
 #include <errno.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/fcntl.h>
 #include <removefile.h>
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <System/sys/fsctl.h> 
 
 #include "hfsmeta.h"
 #include "Sparse.h"
@@ -21,9 +23,11 @@
  * no encryption.
  */
 
-#define MIN(a, b) \
+#ifndef MIN
+# define MIN(a, b) \
 	({ __typeof(a) __a = (a); __typeof(b) __b = (b); \
 		__a < __b ? __a : __b; })
+#endif
 
 /*
  * Context for the sparse bundle routines.  The path name,
@@ -59,6 +63,7 @@ static const char *bundlePrototype =
 "</dict>\n"
 	"</plist>\n";
 
+
 /*
  * Read from a sparse bundle.  If the band file doesn't exist, or is shorter than
  * what we need to get from it, we pad out with 0's.
@@ -68,19 +73,23 @@ doSparseRead(struct IOWrapper *context, off_t offset, void *buffer, off_t len)
 {
 	struct SparseBundleContext *ctx = context->context;
 	off_t blockSize = ctx->bandSize;
-	size_t nread = 0;
+	ssize_t nread = 0;
 	ssize_t retval = -1;
 
 	while (nread < len) {
 		off_t bandNum = (offset + nread) / blockSize;	// Which band file to use
 		off_t bandOffset = (offset + nread) % blockSize;	// how far to go into the file
-		size_t amount = MIN(len - nread, blockSize - bandOffset);	// How many bytes to write in this band file
-		struct stat sbuf;
+		ssize_t amount = MIN(len - nread, blockSize - bandOffset);	// How many bytes to write in this band file
 		char *bandName;
-		ssize_t n;;
+		ssize_t n;
 		int fd;
 
-		asprintf(&bandName, "%s/bands/%x", ctx->pathname, bandNum);
+		asprintf(&bandName, "%s/bands/%llx", ctx->pathname, bandNum);
+		if (!bandName) {
+			warn("Cannot allocate memory for path '%s/bands/%llx'", ctx->pathname, bandNum);
+			retval = -1;
+			goto done;
+		}
 		fd = open(bandName, O_RDONLY);
 		if (fd == -1) {
 			if (errno == ENOENT) {
@@ -95,15 +104,19 @@ doSparseRead(struct IOWrapper *context, off_t offset, void *buffer, off_t len)
 			free(bandName);
 			goto done;
 		}
+
 		n = pread(fd, (char*)buffer + nread, amount, bandOffset);
 		if (n == -1) {
-			warn("Cannot write to band file %s/band/%x for offset %llu for amount %zu", ctx->pathname, bandNum, offset+nread, amount);
+			warn("Cannot read from band file %s for offset %llu for amount %zu", bandName, offset+nread, amount);
 			close(fd);
+			free(bandName);
 			goto done;
 		}
 		if (n < amount) {	// hit EOF, pad out with zeroes
 			memset(buffer + nread + amount, 0, amount - n);
 		}
+		free(bandName);
+		close(fd);
 		nread += n;
 	}
 	retval = nread;
@@ -116,47 +129,67 @@ done:
  * Write a chunk of data to a bundle.
  */
 static ssize_t
-doSparseWrite(IOWrapper_t *context, off_t offset, void *buffer, size_t len)
+doSparseWrite(IOWrapper_t *context, off_t offset, void *buffer, off_t len)
 {
 	struct SparseBundleContext *ctx = context->context;
 	off_t blockSize = ctx->bandSize;
-	size_t written = 0;
+	ssize_t written = 0;
 	ssize_t retval = -1;
 
 	while (written < len) {
 		off_t bandNum = (offset + written) / blockSize;	// Which band file to use
 		off_t bandOffset = (offset + written) % blockSize;	// how far to go into the file
 		size_t amount = MIN(len - written, blockSize - bandOffset);	// How many bytes to write in this band file
-		char *bandName;
 		ssize_t nwritten;
 		int fd;
 
 		if (ctx->cfd == -1 || ctx->cBandNum != bandNum) {
-				if (ctx->cfd != -1)
-					close(ctx->cfd);
-				asprintf(&bandName, "%s/bands/%x", ctx->pathname, bandNum);
-				fd = open(bandName, O_WRONLY | O_CREAT, 0666);
-				if (fd == -1) {
-					warn("Cannot open band file %s for offset %llu", bandName, offset + written);
-					retval = -1;
-					goto done;
-				}
+			char *bandName = NULL;
+
+			if (ctx->cfd != -1) {
+				close(ctx->cfd);
+				ctx->cfd = -1;
+			}
+			asprintf(&bandName, "%s/bands/%llx", ctx->pathname, bandNum);
+			if (!bandName) {
+				warnx("Cannot allocate memory for band %s/bands/%llx", ctx->pathname, bandNum);
+				retval = -1;
+				goto done;
+			}
+
+			fd = open(bandName, O_WRONLY | O_CREAT, 0666);
+			if (fd == -1) {
+				warn("Cannot open band file %s for offset %llu", bandName, offset + written);
 				free(bandName);
-				bandName = NULL;
-				ctx->cfd = fd;
-				ctx->cBandNum = bandNum;
+				retval = -1;
+				goto done;
+			}
+			/*
+			 * When we create a new band file, we sync the volume
+			 * it's on, so that we can ensure that the band file is present
+			 * on disk.  (Otherwise, with a crash, we can end up with the
+			 * data not where we expected.)  In this case, however, we probably
+			 * don't need to wait for it -- just start the sync.
+			 */
+			fsync_volume_np(fd, 0);
+			fcntl(fd, F_NOCACHE, 1);
+			free(bandName);
+			bandName = NULL;
+			ctx->cfd = fd;
+			ctx->cBandNum = bandNum;
 		} else {
 			fd = ctx->cfd;
 		}
 		nwritten = pwrite(fd, (char*)buffer + written, amount, bandOffset);
 		if (nwritten == -1) {
-			warn("Cannot write to band file %s/band/%x for offset %llu for amount %zu", ctx->pathname, bandNum, offset+written, amount);
+			warn("Cannot write to band file %s/band/%llx for offset %llu for amount %zu", ctx->pathname, bandNum, offset+written, amount);
 			close(fd);
 			ctx->cfd = -1;
 			retval = -1;
 			goto done;
 		}
-		(void)fcntl(fd, F_FULLFSYNC, 0);
+		// Sync the data out.
+		fsync(fd);
 		written += nwritten;
 	}
 	retval = written;
@@ -172,31 +205,45 @@ done:
 static ssize_t
 WriteExtentToSparse(struct IOWrapper * context, DeviceInfo_t *devp, off_t start, off_t len, void (^bp)(off_t))
 {
-	const size_t bufSize = 1024 * 1024;
-	uint8_t buffer[bufSize];
+	const ssize_t bufSize = 1024 * 1024;
+	uint8_t *buffer = NULL;
+	ssize_t retval = 0;
 	off_t total = 0;
 
 	if (debug) printf("Writing extent <%lld, %lld>\n", start, len);
+	buffer = malloc(bufSize);
+	if (buffer == NULL) {
+		warn("%s(%s):  Could not allocate %zu bytes for buffer", __FILE__, __FUNCTION__, bufSize);
+		retval = -1;
+		goto done;
+	}
+
 	while (total < len) {
 		ssize_t nread;
 		ssize_t nwritten;
-		size_t amt = MIN(bufSize, len - total);
-		nread = pread(devp->fd, buffer, amt, start + total);
+		ssize_t amt = MIN(bufSize, len - total);
+		nread = UnalignedRead(devp, buffer, amt, start + total);
 		if (nread == -1) {
 			warn("Cannot read from device at offset %lld", start + total);
-			return -1;
+			retval = -1;
+			break;
 		}
 		if (nread < amt) {
 			warnx("Short read from source device -- got %zd, expected %zd", nread, amt);
 		}
 		nwritten = doSparseWrite(context, start + total, buffer, nread);
-		if (nwritten == -1)
-			return -1;
+		if (nwritten == -1) {
+			retval = -1;
+			break;
+		}
 		bp(nread);
 		total += nread;
 	}
 	if (debug) printf("\twrote %lld\n", total);
-	return 0;
+done:
+	if (buffer)
+		free(buffer);
+	return retval;
 }
 
 static const CFStringRef kBandSizeKey = CFSTR("band-size");
@@ -221,7 +268,7 @@ GetSizesFromPlist(const char *path, size_t *bandSize, off_t *devSize)
 	long long tmpLL;
 
 
-	inFileURL = CFURLCreateFromFileSystemRepresentation(NULL, path, strlen(path), FALSE);
+	inFileURL = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), FALSE);
 	if (inFileURL == NULL) {
 		if (debug) warn("Cannot create url from pathname %s", path);
 		goto done;
@@ -368,15 +415,19 @@ struct IOWrapper *
 InitSparseBundle(const char *path, DeviceInfo_t *devp)
 {
 	struct SparseBundleContext ctx = { 0 };
-	struct SparseBundleContext *retctx = NULL;
-	IOWrapper_t *retval = NULL;
+	IOWrapper_t *wrapper = NULL;
 	struct stat sb;
-	char tmpname[strlen(path) + sizeof("Info.plist") + 2];	// '/' + NUL
+	char *tmpname = NULL;
+	int tmplen;
 
 	if (strstr(path, ".sparsebundle") == NULL) {
 		asprintf(&ctx.pathname, "%s.sparsebundle", path);
 	} else {
 		ctx.pathname = strdup(path);
+	}
+
+	if (ctx.pathname == NULL) {
+		return NULL;
 	}
 
 	if (lstat(ctx.pathname, &sb) == -1) {
@@ -392,7 +443,14 @@ InitSparseBundle(const char *path, DeviceInfo_t *devp)
 		warnx("sparse bundle object %s is not a directory", ctx.pathname);
 		goto done;
 	}
-	sprintf(tmpname, "%s/Info.plist", ctx.pathname);
+	/* NB! All names we create inside the bundle directory are shorter
+	 * then "Info.plist", we re-use the buffer allocated here for
+	 * multiple file names. */
+	tmplen = asprintf(&tmpname, "%s/Info.plist", ctx.pathname);
+	if (tmpname == NULL) {
+		goto done;
+	}
+
 	if (stat(tmpname, &sb) != -1) {
 		size_t bandSize = 0;
 		off_t devSize = 0;
@@ -415,46 +473,64 @@ InitSparseBundle(const char *path, DeviceInfo_t *devp)
 			goto done;
 		}
 		ctx.bandSize = kBandSize;
-		fprintf(fp, bundlePrototype, kBandSize, devp->size);
-		fclose(fp);
-		sprintf(tmpname, "%s/Info.bckup", ctx.pathname);
-		fp = fopen(tmpname, "w");
-		if (fp) {
-			fprintf(fp, bundlePrototype, kBandSize, devp->size);
-			fclose(fp);
+		if (fprintf(fp, bundlePrototype, kBandSize, devp->size) < 0) {
+			warn("failed to set bundle information in %s", tmpname);
+			fclose(fp); /* eat error return */
+			goto done;
 		}
-		sprintf(tmpname, "%s/bands", ctx.pathname);
-		if (mkdir(tmpname, 0777) == -1) {
+		if (fclose(fp) != 0) {
+			warn("failed to update bundle information in %s", tmpname);
+			goto done;
+		}
+		snprintf(tmpname, tmplen + 1, "%s/Info.bckup", ctx.pathname);
+		if ((int)strlen(tmpname) == tmplen) { /* Only update backup if we get the full path */
+			/* Failure to create a backup is not fatal */
+			fp = fopen(tmpname, "w");
+			if (fp) {
+				if ((fprintf(fp, bundlePrototype, kBandSize, devp->size) < 0) ||
+					(fclose(fp) < 0)) {
+					unlink(tmpname);
+				}
+			}
+		} else {
+			warn("Cannot create backup bundle information file in %s", tmpname);
+		}
+		if ((snprintf(tmpname, tmplen + 1, "%s/bands", ctx.pathname) > tmplen) ||
+			(mkdir(tmpname, 0777) == -1)) {
 			warn("cannot create bands directory in sparse bundle %s", ctx.pathname);
 			goto done;
 		}
-		sprintf(tmpname, "%s/token", ctx.pathname);
-		close(open(tmpname, O_CREAT | O_TRUNC, 0666));
+		if (snprintf(tmpname, tmplen + 1, "%s/token", ctx.pathname) <= tmplen) {
+			close(open(tmpname, O_CREAT | O_TRUNC, 0666));
+		}
 	}
 
-	retval = malloc(sizeof(*retval));
-	if (retval == NULL) {
-		free(retval);
-		retval = NULL;
-		goto done;
-	}
-	retctx = malloc(sizeof(*retctx));
-	if (retctx) {
-		*retctx = ctx;
-		retctx->cfd = -1;
+	wrapper = malloc(sizeof(*wrapper));
+	if (wrapper) {
+		struct SparseBundleContext *wrapped_ctx;
 
-	}
-	retval->writer = &WriteExtentToSparse;
-	retval->reader = &doSparseRead;
-	retval->getprog = &GetProgress;
-	retval->setprog = &SetProgress;
-	retval->cleanup = &doCleanup;
+		wrapped_ctx = malloc(sizeof(*wrapped_ctx));
+		if (wrapped_ctx) {
+			*wrapped_ctx = ctx;
+			wrapped_ctx->cfd = -1;
 
-	retval->context = retctx;
+			wrapper->writer = &WriteExtentToSparse;
+			wrapper->reader = &doSparseRead;
+			wrapper->getprog = &GetProgress;
+			wrapper->setprog = &SetProgress;
+			wrapper->cleanup = &doCleanup;
+			wrapper->context = wrapped_ctx;
+		} else {
+			free(wrapper);
+			wrapper = NULL;
+		}
+	}
 done:
-	if (retval == NULL) {
+	if (wrapper == NULL) {
 		if (ctx.pathname)
 			free(ctx.pathname);
 	}
-	return retval;
+
+	free(tmpname);
+	return wrapper;
 }
